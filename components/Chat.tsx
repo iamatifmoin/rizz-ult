@@ -1,6 +1,9 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { ToastProvider, useToast } from "@/components/Toast";
+import { toastForNetworkFailure, toastFromApiError } from "@/lib/error-notify";
+import type { ApiErrorPayload } from "@/lib/api-errors";
 
 type Role = "user" | "assistant";
 
@@ -10,6 +13,7 @@ interface Message {
   content: string;
   videoUrl?: string;
   error?: boolean;
+  errorExternal?: boolean;
 }
 
 const DIRECTING_STEPS = [
@@ -35,6 +39,15 @@ function uid() {
 }
 
 export default function Chat() {
+  return (
+    <ToastProvider>
+      <ChatInner />
+    </ToastProvider>
+  );
+}
+
+function ChatInner() {
+  const toast = useToast();
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
@@ -90,22 +103,20 @@ export default function Chat() {
         if (data.type === "video_request") {
           await runVideo(trimmed, data.url ?? null);
         } else if (data.error) {
-          addMessage({
-            id: uid(),
-            role: "assistant",
-            content: data.error,
-            error: true,
-          });
+          notifyError(toast, data);
+          addMessage(errorMessage(data));
         }
       } else {
         await streamText(res);
       }
     } catch {
+      toast(toastForNetworkFailure());
       addMessage({
         id: uid(),
         role: "assistant",
         content: "Something went wrong reaching the server. Mind trying again?",
         error: true,
+        errorExternal: true,
       });
     } finally {
       setBusy(false);
@@ -125,8 +136,20 @@ export default function Chat() {
       const { done, value } = await reader.read();
       if (done) break;
       acc += decoder.decode(value, { stream: true });
-      updateMessage(assistantId, { content: acc });
     }
+
+    const streamError = parseStreamError(acc);
+    if (streamError) {
+      notifyError(toast, streamError);
+      updateMessage(assistantId, {
+        content: streamError.error,
+        error: true,
+        errorExternal: streamError.external,
+      });
+      return;
+    }
+
+    updateMessage(assistantId, { content: acc });
   }
 
   async function runVideo(message: string, url: string | null) {
@@ -141,13 +164,8 @@ export default function Chat() {
       const data = await res.json();
 
       if (!res.ok || data.error) {
-        addMessage({
-          id: uid(),
-          role: "assistant",
-          content:
-            data.error || "Hit a snag assembling the video - mind trying again?",
-          error: true,
-        });
+        notifyError(toast, data);
+        addMessage(errorMessage(data));
         return;
       }
 
@@ -162,6 +180,7 @@ export default function Chat() {
         videoUrl: data.videoUrl,
       });
     } catch {
+      toast(toastForNetworkFailure());
       addMessage({
         id: uid(),
         role: "assistant",
@@ -386,6 +405,12 @@ function MessageBubble({ message }: { message: Message }) {
           </p>
         )}
 
+        {message.error && message.errorExternal && (
+          <p className="mt-2 rounded-lg border border-sky/30 bg-sky/10 px-2 py-1.5 text-[10px] leading-4 text-[#1a5f8a]">
+            Not a Rizz-ult bug — an external API had a moment. Safe to retry.
+          </p>
+        )}
+
         {message.videoUrl && (
           <div className="mt-3 w-fit max-w-full overflow-hidden rounded-xl border border-black/10 p-0.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.05)]">
             <video
@@ -444,4 +469,30 @@ function Dot({ delay }: { delay: string }) {
       style={{ animationDelay: delay }}
     />
   );
+}
+
+function errorMessage(data: Partial<ApiErrorPayload>): Message {
+  return {
+    id: uid(),
+    role: "assistant",
+    content: data.error ?? "Something went wrong. Mind trying again?",
+    error: true,
+    errorExternal: Boolean(data.external),
+  };
+}
+
+function notifyError(
+  toast: (input: ReturnType<typeof toastFromApiError>) => void,
+  data: Partial<ApiErrorPayload>
+) {
+  toast(toastFromApiError(data));
+}
+
+function parseStreamError(acc: string): ApiErrorPayload | null {
+  if (!acc.startsWith("@@ERROR@@")) return null;
+  try {
+    return JSON.parse(acc.slice("@@ERROR@@".length)) as ApiErrorPayload;
+  } catch {
+    return null;
+  }
 }

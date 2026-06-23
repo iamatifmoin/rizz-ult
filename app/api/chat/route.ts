@@ -1,4 +1,5 @@
 import { NextRequest } from "next/server";
+import { classifyApiError } from "@/lib/api-errors";
 import { CLAUDE_MODEL, getAnthropic } from "@/lib/anthropic";
 import { classifyIntent } from "@/lib/intent";
 
@@ -31,38 +32,43 @@ export async function POST(req: NextRequest) {
   }
 
   // Casual chat: stream Claude's reply as plain text.
-  const encoder = new TextEncoder();
+  try {
+    const anthropic = getAnthropic();
+    const encoder = new TextEncoder();
 
-  const stream = new ReadableStream<Uint8Array>({
-    async start(controller) {
-      try {
-        const anthropic = getAnthropic();
-        const claudeStream = anthropic.messages.stream({
-          model: CLAUDE_MODEL,
-          max_tokens: 400,
-          system: CHAT_SYSTEM_PROMPT,
-          messages: [{ role: "user", content: message }],
-        });
+    const stream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        try {
+          const claudeStream = anthropic.messages.stream({
+            model: CLAUDE_MODEL,
+            max_tokens: 400,
+            system: CHAT_SYSTEM_PROMPT,
+            messages: [{ role: "user", content: message }],
+          });
 
-        claudeStream.on("text", (text) => {
-          controller.enqueue(encoder.encode(text));
-        });
+          claudeStream.on("text", (text) => {
+            controller.enqueue(encoder.encode(text));
+          });
 
-        await claudeStream.finalMessage();
-        controller.close();
-      } catch {
-        controller.enqueue(
-          encoder.encode("Sorry, I hit a snag responding. Mind trying again?")
-        );
-        controller.close();
-      }
-    },
-  });
+          await claudeStream.finalMessage();
+          controller.close();
+        } catch (err) {
+          const payload = classifyApiError(err, "anthropic");
+          controller.enqueue(
+            encoder.encode(`@@ERROR@@${JSON.stringify(payload)}`)
+          );
+          controller.close();
+        }
+      },
+    });
 
-  return new Response(stream, {
-    headers: {
-      "Content-Type": "text/plain; charset=utf-8",
-      "Cache-Control": "no-store",
-    },
-  });
+    return new Response(stream, {
+      headers: {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Cache-Control": "no-store",
+      },
+    });
+  } catch (err) {
+    return Response.json(classifyApiError(err, "anthropic"), { status: 502 });
+  }
 }

@@ -1,4 +1,5 @@
 import { NextRequest } from "next/server";
+import { classifyApiError } from "@/lib/api-errors";
 import { scrapeUrl } from "@/lib/scrape";
 import { directVideo } from "@/lib/director";
 import { searchPexelsVideo } from "@/lib/assets/pexels";
@@ -43,14 +44,7 @@ export async function POST(req: NextRequest) {
   try {
     plan = await directVideo({ userMessage: message, scrapedContent });
   } catch (err) {
-    return Response.json(
-      {
-        error:
-          "I couldn't put together a creative plan just now — mind trying again?",
-        detail: errMsg(err),
-      },
-      { status: 502 }
-    );
+    return Response.json(classifyApiError(err, "anthropic"), { status: 502 });
   }
 
   // 3) Fetch assets in parallel.
@@ -62,14 +56,8 @@ export async function POST(req: NextRequest) {
     ]);
     audioPath = audioFileForMood(plan.audio_mood);
   } catch (err) {
-    return Response.json(
-      {
-        error:
-          "I had trouble scouting the right footage or GIF — mind trying again?",
-        detail: errMsg(err),
-      },
-      { status: 502 }
-    );
+    const source = errMsg(err).toLowerCase().includes("giphy") ? "giphy" : "pexels";
+    return Response.json(classifyApiError(err, source), { status: 502 });
   }
 
   // 4) Composite with ffmpeg.
@@ -82,13 +70,7 @@ export async function POST(req: NextRequest) {
       scrapeFailed,
     });
   } catch (err) {
-    return Response.json(
-      {
-        error: "Hit a snag assembling the video — mind trying again?",
-        detail: errMsg(err),
-      },
-      { status: 500 }
-    );
+    return Response.json(classifyApiError(err, "app"), { status: 500 });
   }
 }
 
