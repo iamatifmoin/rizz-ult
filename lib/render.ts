@@ -1,17 +1,25 @@
 import path from "node:path";
 import fs from "node:fs";
+import os from "node:os";
 import { randomUUID } from "node:crypto";
 import ffmpeg from "fluent-ffmpeg";
+import "@/lib/ffmpeg-config";
 import type { DirectorPlan } from "./director";
 import type { GiphyPick } from "./assets/giphy";
 import type { PexelsPick } from "./assets/pexels";
 
 const ROOT = process.cwd();
-const TMP_DIR = path.join(ROOT, "tmp");
-const VIDEOS_DIR = path.join(ROOT, "public", "videos");
-// Relative (forward-slash) path avoids Windows drive-colon escaping inside the
-// drawtext filter, where ":" separates options.
-const FONT_REL = "public/fonts/caption.ttf";
+const IS_SERVERLESS = Boolean(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
+
+// Vercel/Lambda only allow writes under /tmp; local dev keeps project dirs.
+const TMP_DIR = IS_SERVERLESS
+  ? path.join(os.tmpdir(), "rizzult")
+  : path.join(ROOT, "tmp");
+const VIDEOS_DIR = IS_SERVERLESS
+  ? path.join(os.tmpdir(), "rizzult-videos")
+  : path.join(ROOT, "public", "videos");
+
+const FONT_PATH = toFfmpegPath(path.join(ROOT, "public", "fonts", "caption.ttf"));
 
 const RENDER_TIMEOUT_MS = 25_000;
 
@@ -44,24 +52,30 @@ export async function renderVideo(inputs: RenderInputs): Promise<string> {
     // caption font can't render), then wrap into stacked lines. Each line is
     // written to its own textfile so drawtext never has to escape the text.
     const lines = wrapCaption(sanitizeCaption(inputs.plan.hook_caption));
-    const lineRelPaths = lines.map((line, i) => {
+    const lineTextPaths = lines.map((line, i) => {
       const abs = path.join(jobDir, `line${i}.txt`);
       fs.writeFileSync(abs, line, "utf8");
-      return path.relative(ROOT, abs).split(path.sep).join("/");
+      return toFfmpegPath(abs);
     });
 
     await runFfmpeg({
       bgPath,
       gifPath,
       audioPath: inputs.audioPath,
-      lineRelPaths,
+      lineTextPaths,
       outAbs,
       plan: inputs.plan,
     });
 
+    if (IS_SERVERLESS) {
+      const buf = fs.readFileSync(outAbs);
+      safeRm(outAbs);
+      return `data:video/mp4;base64,${buf.toString("base64")}`;
+    }
+
     return `/videos/${id}.mp4`;
   } finally {
-    // Best-effort cleanup of the working dir (keep the final output).
+    // Best-effort cleanup of the working dir (keep the final output locally).
     safeRm(jobDir);
   }
 }
@@ -74,11 +88,11 @@ function runFfmpeg(args: {
   bgPath: string;
   gifPath: string;
   audioPath: string;
-  lineRelPaths: string[];
+  lineTextPaths: string[];
   outAbs: string;
   plan: DirectorPlan;
 }): Promise<void> {
-  const { bgPath, gifPath, audioPath, lineRelPaths, outAbs, plan } = args;
+  const { bgPath, gifPath, audioPath, lineTextPaths, outAbs, plan } = args;
   const dur = plan.duration_seconds;
   // The meme is the star — keep it on screen the whole clip. "end" just delays
   // it by a short beat so it can still land as a punchline; "middle" is instant.
@@ -86,12 +100,12 @@ function runFfmpeg(args: {
 
   // One drawtext per line, each independently centered (x=(w-text_w)/2) so the
   // block is truly center-aligned rather than left-aligned.
-  const drawtextSteps = lineRelPaths.map((rel, i) => {
+  const drawtextSteps = lineTextPaths.map((textPath, i) => {
     const inLabel = i === 0 ? "[ov]" : `[t${i - 1}]`;
-    const outLabel = i === lineRelPaths.length - 1 ? "[outv]" : `[t${i}]`;
+    const outLabel = i === lineTextPaths.length - 1 ? "[outv]" : `[t${i}]`;
     const y = CAPTION_TOP + i * LINE_HEIGHT;
     return (
-      `${inLabel}drawtext=fontfile=${FONT_REL}:textfile=${rel}:expansion=none:` +
+      `${inLabel}drawtext=fontfile=${FONT_PATH}:textfile=${textPath}:expansion=none:` +
       `fontcolor=white:fontsize=${FONT_SIZE}:borderw=5:bordercolor=black@0.9:` +
       `x=(w-text_w)/2:y=${y}${outLabel}`
     );
@@ -183,6 +197,18 @@ async function download(url: string, dest: string): Promise<void> {
 }
 
 /**
+ * Paths passed into ffmpeg drawtext filters. On serverless, assets live under
+ * /tmp so we use absolute forward-slash paths. Locally, project-relative paths
+ * avoid Windows drive-colon escaping inside the filter string.
+ */
+function toFfmpegPath(abs: string): string {
+  if (IS_SERVERLESS) {
+    return abs.split(path.sep).join("/");
+  }
+  return path.relative(ROOT, abs).split(path.sep).join("/");
+}
+
+/**
  * Reduce a caption to renderable ASCII. The bundled caption font has no glyphs
  * for emoji / curly quotes / dashes / other unicode, which render as broken
  * "tofu" boxes — so we normalize the common ones and strip the rest.
@@ -223,9 +249,9 @@ function ensureDir(dir: string): void {
   fs.mkdirSync(dir, { recursive: true });
 }
 
-function safeRm(dir: string): void {
+function safeRm(target: string): void {
   try {
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(target, { recursive: true, force: true });
   } catch {
     /* ignore */
   }
