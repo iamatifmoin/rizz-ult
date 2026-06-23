@@ -10,7 +10,8 @@ export const runtime = "nodejs";
 // The whole pipeline (scrape -> director -> fetch -> ffmpeg) runs in one
 // request. Fine for a take-home; a production build would make this an async
 // job with a poll/webhook so we don't hold an HTTP connection open this long.
-export const maxDuration = 120;
+// Hobby max is 60s (legacy) or 300s (fluid compute); 60 is enough for this pipeline.
+export const maxDuration = 60;
 
 export async function POST(req: NextRequest) {
   let message = "";
