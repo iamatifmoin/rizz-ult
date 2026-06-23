@@ -4,6 +4,7 @@ import os from "node:os";
 import { randomUUID } from "node:crypto";
 import ffmpeg from "fluent-ffmpeg";
 import "@/lib/ffmpeg-config";
+import { writeCaptionPng } from "@/lib/caption-image";
 import type { DirectorPlan } from "./director";
 import type { GiphyPick } from "./assets/giphy";
 import type { PexelsPick } from "./assets/pexels";
@@ -19,8 +20,7 @@ const VIDEOS_DIR = IS_SERVERLESS
   ? path.join(os.tmpdir(), "rizzult-videos")
   : path.join(ROOT, "public", "videos");
 
-const FONT_PATH = toFfmpegPath(path.join(ROOT, "public", "fonts", "caption.ttf"));
-
+const CAPTION_TOP = 250; // px from top (upper third of the 1920px-tall frame)
 const RENDER_TIMEOUT_MS = 25_000;
 
 export interface RenderInputs {
@@ -40,29 +40,23 @@ export async function renderVideo(inputs: RenderInputs): Promise<string> {
 
   const bgPath = path.join(jobDir, "bg.mp4");
   const gifPath = path.join(jobDir, `gif.${inputs.giphy.kind}`);
+  const captionPath = path.join(jobDir, "caption.png");
   const outAbs = path.join(VIDEOS_DIR, `${id}.mp4`);
 
   try {
+    const lines = wrapCaption(sanitizeCaption(inputs.plan.hook_caption));
+
     await Promise.all([
       download(inputs.pexels.url, bgPath),
       download(inputs.giphy.url, gifPath),
+      writeCaptionPng(lines, captionPath),
     ]);
-
-    // Sanitize to renderable ASCII (drop emojis/curly quotes/etc. that the
-    // caption font can't render), then wrap into stacked lines. Each line is
-    // written to its own textfile so drawtext never has to escape the text.
-    const lines = wrapCaption(sanitizeCaption(inputs.plan.hook_caption));
-    const lineTextPaths = lines.map((line, i) => {
-      const abs = path.join(jobDir, `line${i}.txt`);
-      fs.writeFileSync(abs, line, "utf8");
-      return toFfmpegPath(abs);
-    });
 
     await runFfmpeg({
       bgPath,
       gifPath,
       audioPath: inputs.audioPath,
-      lineTextPaths,
+      captionPath,
       outAbs,
       plan: inputs.plan,
     });
@@ -75,47 +69,30 @@ export async function renderVideo(inputs: RenderInputs): Promise<string> {
 
     return `/videos/${id}.mp4`;
   } finally {
-    // Best-effort cleanup of the working dir (keep the final output locally).
     safeRm(jobDir);
   }
 }
-
-const FONT_SIZE = 66;
-const LINE_HEIGHT = 84;
-const CAPTION_TOP = 250; // px from top (upper third of the 1920px-tall frame)
 
 function runFfmpeg(args: {
   bgPath: string;
   gifPath: string;
   audioPath: string;
-  lineTextPaths: string[];
+  captionPath: string;
   outAbs: string;
   plan: DirectorPlan;
 }): Promise<void> {
-  const { bgPath, gifPath, audioPath, lineTextPaths, outAbs, plan } = args;
+  const { bgPath, gifPath, audioPath, captionPath, outAbs, plan } = args;
   const dur = plan.duration_seconds;
-  // The meme is the star — keep it on screen the whole clip. "end" just delays
-  // it by a short beat so it can still land as a punchline; "middle" is instant.
   const gifStart = plan.gif_timing === "end" ? 1 : 0;
 
-  // One drawtext per line, each independently centered (x=(w-text_w)/2) so the
-  // block is truly center-aligned rather than left-aligned.
-  const drawtextSteps = lineTextPaths.map((textPath, i) => {
-    const inLabel = i === 0 ? "[ov]" : `[t${i - 1}]`;
-    const outLabel = i === lineTextPaths.length - 1 ? "[outv]" : `[t${i}]`;
-    const y = CAPTION_TOP + i * LINE_HEIGHT;
-    return (
-      `${inLabel}drawtext=fontfile=${FONT_PATH}:textfile=${textPath}:expansion=none:` +
-      `fontcolor=white:fontsize=${FONT_SIZE}:borderw=5:bordercolor=black@0.9:` +
-      `x=(w-text_w)/2:y=${y}${outLabel}`
-    );
-  });
-
+  // drawtext is not available in ffmpeg-static on Linux/serverless, so captions
+  // are pre-rendered to PNG and composited with overlay instead.
   const filter = [
     "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30[bg]",
     "[1:v]scale=860:-1[gif]",
     `[bg][gif]overlay=x=(W-w)/2:y=H-h-150:enable='between(t,${gifStart},${dur})'[ov]`,
-    ...drawtextSteps,
+    "[3:v]format=rgba[caption]",
+    `[ov][caption]overlay=x=(W-w)/2:y=${CAPTION_TOP}[outv]`,
   ].join(";");
 
   return new Promise<void>((resolve, reject) => {
@@ -128,6 +105,8 @@ function runFfmpeg(args: {
       .inputOptions(["-stream_loop", "-1"])
       .input(audioPath)
       .inputOptions(["-stream_loop", "-1"])
+      .input(captionPath)
+      .inputOptions(["-loop", "1"])
       .complexFilter(filter)
       .outputOptions([
         "-map",
@@ -196,37 +175,19 @@ async function download(url: string, dest: string): Promise<void> {
   }
 }
 
-/**
- * Paths passed into ffmpeg drawtext filters. On serverless, assets live under
- * /tmp so we use absolute forward-slash paths. Locally, project-relative paths
- * avoid Windows drive-colon escaping inside the filter string.
- */
-function toFfmpegPath(abs: string): string {
-  if (IS_SERVERLESS) {
-    return abs.split(path.sep).join("/");
-  }
-  return path.relative(ROOT, abs).split(path.sep).join("/");
-}
-
-/**
- * Reduce a caption to renderable ASCII. The bundled caption font has no glyphs
- * for emoji / curly quotes / dashes / other unicode, which render as broken
- * "tofu" boxes — so we normalize the common ones and strip the rest.
- */
 function sanitizeCaption(raw: string): string {
   const cleaned = raw
     .normalize("NFKD")
-    .replace(/[\u2018\u2019\u201A\u201B\u2032]/g, "'") // curly single quotes
-    .replace(/[\u201C\u201D\u201E\u201F\u2033]/g, '"') // curly double quotes
-    .replace(/[\u2013\u2014\u2015\u2212]/g, "-") // en/em/minus dashes
-    .replace(/\u2026/g, "...") // ellipsis
-    .replace(/[^\x20-\x7E]/g, "") // drop anything else outside printable ASCII
+    .replace(/[\u2018\u2019\u201A\u201B\u2032]/g, "'")
+    .replace(/[\u201C\u201D\u201E\u201F\u2033]/g, '"')
+    .replace(/[\u2013\u2014\u2015\u2212]/g, "-")
+    .replace(/\u2026/g, "...")
+    .replace(/[^\x20-\x7E]/g, "")
     .replace(/\s+/g, " ")
     .trim();
   return cleaned || "wait this is actually kind of genius";
 }
 
-/** Soft-wrap a short caption into stacked lines for the vertical frame. */
 function wrapCaption(caption: string, maxChars = 18): string[] {
   const words = caption.trim().split(/\s+/);
   const lines: string[] = [];

@@ -1,7 +1,7 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  serverExternalPackages: ["ffmpeg-static", "fluent-ffmpeg"],
+  serverExternalPackages: ["ffmpeg-static", "fluent-ffmpeg", "sharp"],
   outputFileTracingIncludes: {
     "/api/generate-video": [
       "./node_modules/ffmpeg-static/ffmpeg",
