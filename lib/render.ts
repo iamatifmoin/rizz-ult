@@ -106,7 +106,7 @@ function runFfmpeg(args: {
       .input(audioPath)
       .inputOptions(["-stream_loop", "-1"])
       .input(captionPath)
-      .inputOptions(["-loop", "1"])
+      .inputOptions(["-loop", "1", "-framerate", "30"])
       .complexFilter(filter)
       .outputOptions([
         "-map",
